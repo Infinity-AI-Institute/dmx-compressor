@@ -320,7 +320,8 @@ class OptimalBrainCompressor:
             Q[:, i1:i2] = _Q
             W[:, i2:] -= _E.matmul(Hinv[i1:i2, i2:])
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         self.module.weight.data = Q.reshape(self.module.weight.shape).to(
             self.module.weight.data.dtype
