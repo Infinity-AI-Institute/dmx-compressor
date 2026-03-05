@@ -1,10 +1,10 @@
 """
-MXINT8 weight quantization example using Qwen3-0.6B.
+BFP16 (MXINT8) weight quantization example using Qwen3-0.6B.
 
-Quantizes Linear layer weights to packed MXINT8 format (int8 mantissas +
-uint8 shared exponents per block), saves as safetensors, and verifies
-lossless roundtrip. Non-Linear parameters (embeddings, norms) are kept
-in FP16.
+Quantizes Linear layer weights to packed Block Floating Point format
+(8-bit int mantissas + 8-bit shared exponent per block). In D-Matrix's
+type system this is BFP16_32 (= 8-bit mantissa + 8-bit shared exponent,
+block size 32). OCP calls the same format "MXINT8".
 
 Usage:
     python examples/mxint8_weight_quantization.py
@@ -14,6 +14,8 @@ Output format (safetensors):
     {layer}.scales     - uint8 shared exponent per block, shape [Cout, Cin // block_size]
     {layer}.bias       - float16 (if present)
     other params       - float16 (embeddings, norms, etc.)
+
+D-Matrix hardware type ID: DMX_BFP_16_32 (10007)
 """
 
 import json
@@ -26,9 +28,9 @@ from dmx.compressor.numerical.format import MXINT
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 PROMPT = "The future of AI hardware is"
-OUTPUT_DIR = "./qwen3-0.6b-mxint8"
+OUTPUT_DIR = "./qwen3-0.6b-bfp16"
 BLOCK_SIZE = 32
-PRECISION = 8  # total bits per element (1 sign + 7 mantissa)
+PRECISION = 8  # mantissa bits per element (1 sign + 7 magnitude)
 
 
 def generate(model, tokenizer, prompt, max_new_tokens=50):
@@ -44,11 +46,11 @@ def generate(model, tokenizer, prompt, max_new_tokens=50):
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 
-# ── MXINT8 packing ──────────────────────────────────────────────────────────
+# ── BFP packing ─────────────────────────────────────────────────────────────
 
 
-def pack_mxint8(weight, block_size=BLOCK_SIZE):
-    """Pack a FP32 weight tensor into MXINT8: (uint8 scales, int8 mantissas).
+def pack_bfp(weight, block_size=BLOCK_SIZE):
+    """Pack a FP32 weight tensor into BFP: (uint8 scales, int8 mantissas).
 
     For each block of `block_size` elements along dim=-1:
       - shared_exp = floor(log2(max(|x|))) in the block
@@ -77,14 +79,14 @@ def pack_mxint8(weight, block_size=BLOCK_SIZE):
     scale = (2.0 ** (shared_exp - 6)).unsqueeze(-1)  # [Cout, num_blocks, 1]
     mantissas = torch.clamp(torch.round(blocks / scale), -127, 127).to(torch.int8)
 
-    # Bias the exponent for uint8 storage (OCP MX uses E8M0 with bias=127)
+    # Bias the exponent for uint8 storage (E8M0 with bias=127)
     scales = (shared_exp + 127).to(torch.uint8)
 
     return scales, mantissas.reshape(Cout, Cin)
 
 
-def unpack_mxint8(scales, mantissas, block_size=BLOCK_SIZE):
-    """Unpack MXINT8 (uint8 scales, int8 mantissas) back to FP32."""
+def unpack_bfp(scales, mantissas, block_size=BLOCK_SIZE):
+    """Unpack BFP (uint8 scales, int8 mantissas) back to FP32."""
     Cout, Cin = mantissas.shape
     shared_exp = scales.float() - 127  # remove bias
     scale = (2.0 ** (shared_exp - 6)).unsqueeze(-1)
@@ -104,7 +106,7 @@ baseline_text = generate(model, tokenizer, PROMPT)
 print(f"\n{'FP32 baseline':>20}: {baseline_text}")
 
 # --- Quantize & pack all Linear weights ---
-mxint8 = MXINT(precision=PRECISION, block_size=BLOCK_SIZE)
+bfp = MXINT(precision=PRECISION, block_size=BLOCK_SIZE)
 packed_tensors = {}
 num_quantized = 0
 num_roundtrip_mismatches = 0
@@ -114,14 +116,14 @@ for name, module in model.named_modules():
         continue
 
     w = module.weight.data
-    # Use MXINT.cast() as ground truth for the quantized values
-    w_quantized = mxint8.cast(w, block_dim=-1)
+    # Use BlockFloatingPoint.cast() as ground truth for the quantized values
+    w_quantized = bfp.cast(w, block_dim=-1)
 
     # Pack into int8 mantissas + uint8 scales
-    scales, mantissas = pack_mxint8(w)
+    scales, mantissas = pack_bfp(w)
 
-    # Verify roundtrip: unpack must match MXINT.cast() exactly
-    w_roundtrip = unpack_mxint8(scales, mantissas)
+    # Verify roundtrip: unpack must match cast() exactly
+    w_roundtrip = unpack_bfp(scales, mantissas)
     if not torch.equal(w_quantized, w_roundtrip):
         max_err = (w_quantized - w_roundtrip).abs().max().item()
         num_roundtrip_mismatches += 1
@@ -137,15 +139,15 @@ for name, module in model.named_modules():
     module.weight.data = w_quantized
     num_quantized += 1
 
-print(f"\nPacked {num_quantized} Linear layers to MXINT8 (block_size={BLOCK_SIZE})")
+print(f"\nPacked {num_quantized} Linear layers to BFP16_32 (block_size={BLOCK_SIZE})")
 if num_roundtrip_mismatches == 0:
-    print("All layers pass lossless roundtrip check (pack → unpack == MXINT.cast)")
+    print("All layers pass lossless roundtrip check (pack → unpack == BFP.cast)")
 else:
     print(f"WARNING: {num_roundtrip_mismatches} layers had roundtrip mismatches")
 
 # --- Generate with quantized weights ---
 quantized_text = generate(model, tokenizer, PROMPT)
-print(f"\n{'MXINT8 quantized':>20}: {quantized_text}")
+print(f"\n{'BFP16 quantized':>20}: {quantized_text}")
 
 # --- Save packed model ---
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -158,15 +160,19 @@ for name, param in model.named_parameters():
         continue
     packed_tensors[name] = param.data.half()
 
-print(f"\nSaving packed MXINT8 model to {OUTPUT_DIR}...")
+print(f"\nSaving packed BFP16 model to {OUTPUT_DIR}...")
 save_file(packed_tensors, os.path.join(OUTPUT_DIR, "model.safetensors"))
 tokenizer.save_pretrained(OUTPUT_DIR)
 model.config.save_pretrained(OUTPUT_DIR)
 
 # Save quantization metadata
 quant_config = {
-    "quant_method": "mxint8",
-    "precision": PRECISION,
+    "quant_method": "bfp",
+    "dmx_type_id": "DMX_BFP_16_32",
+    "dmx_type_enum": 10007,
+    "ocp_name": "MXINT8",
+    "mantissa_bits": PRECISION,
+    "shared_exponent_bits": 8,
     "block_size": BLOCK_SIZE,
     "scale_format": "uint8_e8m0_bias127",
     "mantissa_format": "int8_symmetric",
@@ -182,7 +188,7 @@ loaded = load_file(os.path.join(OUTPUT_DIR, "model.safetensors"))
 
 # Spot-check: reconstruct first Linear layer and compare
 first_linear = next(n for n, _ in model.named_modules() if isinstance(_, torch.nn.Linear))
-w_reloaded = unpack_mxint8(loaded[f"{first_linear}.scales"], loaded[f"{first_linear}.mantissas"])
+w_reloaded = unpack_bfp(loaded[f"{first_linear}.scales"], loaded[f"{first_linear}.mantissas"])
 w_model = dict(model.named_modules())[first_linear].weight.data
 
 assert torch.equal(w_reloaded, w_model), "MISMATCH: reloaded weights differ!"
@@ -192,5 +198,5 @@ print(f"Verified: {first_linear} weights match after reload.")
 fp32_size = sum(p.numel() * 4 for p in model.parameters()) / 1e6
 packed_size = os.path.getsize(os.path.join(OUTPUT_DIR, "model.safetensors")) / 1e6
 print(f"\nFP32 model size:    {fp32_size:.1f} MB (in memory)")
-print(f"Packed MXINT8 size: {packed_size:.1f} MB (on disk)")
+print(f"Packed BFP16 size:  {packed_size:.1f} MB (on disk)")
 print(f"Compression ratio:  {fp32_size / packed_size:.2f}x")
