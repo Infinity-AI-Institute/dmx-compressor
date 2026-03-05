@@ -26,7 +26,7 @@ OUTPUT_DIR = "./qwen3-0.6b-mxint8"
 # --- Step 1: Load model ---
 print(f"Loading {MODEL_ID}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float32)
 model.eval()
 
 
@@ -69,7 +69,7 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 
 # --- Step 6: Reload and verify ---
 print("Reloading saved model to verify...")
-reloaded_model = AutoModelForCausalLM.from_pretrained(OUTPUT_DIR, torch_dtype=torch.float32)
+reloaded_model = AutoModelForCausalLM.from_pretrained(OUTPUT_DIR, dtype=torch.float32)
 reloaded_model.eval()
 
 reloaded_text = generate(reloaded_model, PROMPT)
